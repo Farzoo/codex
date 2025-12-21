@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task;
 
+use crate::busy_conversations::BusyConversations;
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
@@ -40,6 +41,7 @@ pub(crate) struct MessageProcessor {
     initialized: bool,
     codex_linux_sandbox_exe: Option<PathBuf>,
     thread_manager: Arc<ThreadManager>,
+    busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
 }
 
@@ -67,6 +69,7 @@ impl MessageProcessor {
             initialized: false,
             codex_linux_sandbox_exe,
             thread_manager,
+            busy_conversations: BusyConversations::default(),
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -380,6 +383,7 @@ impl MessageProcessor {
         // Clone outgoing and server to move into async task.
         let outgoing = self.outgoing.clone();
         let thread_manager = self.thread_manager.clone();
+        let busy_conversations = self.busy_conversations.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
 
         // Spawn an async task to handle the Codex session so that we do not
@@ -392,6 +396,7 @@ impl MessageProcessor {
                 config,
                 outgoing,
                 thread_manager,
+                busy_conversations,
                 running_requests_id_to_codex_uuid,
             )
             .await;
@@ -458,14 +463,35 @@ impl MessageProcessor {
             }
         };
 
+        if let Err(owner) = self
+            .busy_conversations
+            .try_acquire(thread_id, &request_id)
+            .await
+        {
+            let owner_text = owner.to_string();
+            let result = CallToolResult {
+                content: vec![rmcp::model::Content::text(format!(
+                    "Conversation busy for conversation_id: {thread_id} (in-flight request: {owner_text})"
+                ))],
+                structured_content: None,
+                is_error: Some(true),
+                meta: None,
+            };
+            self.outgoing.send_response(request_id, result).await;
+            return;
+        }
+
         // Clone outgoing to move into async task.
         let outgoing = self.outgoing.clone();
+        let thread_manager = self.thread_manager.clone();
+        let busy_conversations = self.busy_conversations.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
 
-        let codex = match self.thread_manager.get_thread(thread_id).await {
+        let codex = match thread_manager.get_thread(thread_id).await {
             Ok(c) => c,
             Err(_) => {
                 tracing::warn!("Session not found for thread_id: {thread_id}");
+                busy_conversations.release(thread_id, &request_id).await;
                 let result = crate::codex_tool_runner::create_call_tool_result_with_thread_id(
                     thread_id,
                     format!("Session not found for thread_id: {thread_id}"),
@@ -489,6 +515,7 @@ impl MessageProcessor {
                     outgoing,
                     request_id,
                     prompt,
+                    busy_conversations,
                     running_requests_id_to_codex_uuid,
                 )
                 .await;
