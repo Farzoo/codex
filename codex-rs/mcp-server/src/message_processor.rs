@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::busy_conversations::BusyConversations;
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
@@ -41,6 +42,7 @@ pub(crate) struct MessageProcessor {
     initialized: bool,
     codex_linux_sandbox_exe: Option<PathBuf>,
     conversation_manager: Arc<ConversationManager>,
+    busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
 }
 
@@ -65,6 +67,7 @@ impl MessageProcessor {
             initialized: false,
             codex_linux_sandbox_exe,
             conversation_manager,
+            busy_conversations: BusyConversations::default(),
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -404,6 +407,7 @@ impl MessageProcessor {
         // Clone outgoing and server to move into async task.
         let outgoing = self.outgoing.clone();
         let conversation_manager = self.conversation_manager.clone();
+        let busy_conversations = self.busy_conversations.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
 
         // Spawn an async task to handle the Codex session so that we do not
@@ -416,6 +420,7 @@ impl MessageProcessor {
                 config,
                 outgoing,
                 conversation_manager,
+                busy_conversations,
                 running_requests_id_to_codex_uuid,
             )
             .await;
@@ -489,9 +494,35 @@ impl MessageProcessor {
             }
         };
 
+        if let Err(owner) = self
+            .busy_conversations
+            .try_acquire(conversation_id, &request_id)
+            .await
+        {
+            let owner_text = match owner {
+                RequestId::String(s) => s,
+                RequestId::Integer(i) => i.to_string(),
+            };
+            let result = CallToolResult {
+                content: vec![ContentBlock::TextContent(TextContent {
+                    r#type: "text".to_owned(),
+                    text: format!(
+                        "Conversation busy for conversation_id: {conversation_id} (in-flight request: {owner_text})"
+                    ),
+                    annotations: None,
+                })],
+                is_error: Some(true),
+                structured_content: None,
+            };
+            self.send_response::<mcp_types::CallToolRequest>(request_id, result)
+                .await;
+            return;
+        }
+
         // Clone outgoing to move into async task.
         let outgoing = self.outgoing.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
+        let busy_conversations = self.busy_conversations.clone();
 
         let codex = match self
             .conversation_manager
@@ -501,6 +532,9 @@ impl MessageProcessor {
             Ok(c) => c,
             Err(_) => {
                 tracing::warn!("Session not found for conversation_id: {conversation_id}");
+                self.busy_conversations
+                    .release(conversation_id, &request_id)
+                    .await;
                 let result = CallToolResult {
                     content: vec![ContentBlock::TextContent(TextContent {
                         r#type: "text".to_owned(),
@@ -528,6 +562,7 @@ impl MessageProcessor {
                     request_id,
                     prompt,
                     running_requests_id_to_codex_uuid,
+                    busy_conversations,
                     conversation_id,
                 )
                 .await;

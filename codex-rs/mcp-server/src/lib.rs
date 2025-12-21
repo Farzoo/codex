@@ -1,4 +1,4 @@
-//! Prototype MCP server.
+﻿//! Prototype MCP server.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 use std::io::ErrorKind;
@@ -21,6 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 mod codex_tool_config;
 mod codex_tool_runner;
+mod busy_conversations;
 mod error_code;
 mod exec_approval;
 pub(crate) mod message_processor;
@@ -147,3 +148,4 @@ pub async fn run_main(
 
     Ok(())
 }
+

@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::busy_conversations::BusyConversations;
 use crate::exec_approval::handle_exec_approval_request;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotificationMeta;
@@ -42,6 +43,7 @@ pub async fn run_codex_tool_session(
     config: CodexConfig,
     outgoing: Arc<OutgoingMessageSender>,
     conversation_manager: Arc<ConversationManager>,
+    busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
 ) {
     let NewConversation {
@@ -64,6 +66,32 @@ pub async fn run_codex_tool_session(
             return;
         }
     };
+
+    if let Err(owner) = busy_conversations
+        .try_acquire(conversation_id, &id)
+        .await
+    {
+        let owner_text = match owner {
+            RequestId::String(s) => s,
+            RequestId::Integer(i) => i.to_string(),
+        };
+        let result = CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                r#type: "text".to_string(),
+                text: format!(
+                    "Conversation busy for conversation_id: {conversation_id} (in-flight request: {owner_text})"
+                ),
+                annotations: None,
+            })],
+            is_error: Some(true),
+            structured_content: None,
+        };
+        outgoing.send_response(id.clone(), result).await;
+        conversation_manager
+            .remove_conversation(&conversation_id)
+            .await;
+        return;
+    }
 
     let session_configured_event = Event {
         // Use a fake id value for now.
@@ -101,6 +129,7 @@ pub async fn run_codex_tool_session(
         tracing::error!("Failed to submit initial prompt: {e}");
         // unregister the id so we don't keep it in the map
         running_requests_id_to_codex_uuid.lock().await.remove(&id);
+        busy_conversations.release(conversation_id, &id).await;
         return;
     }
 
@@ -109,6 +138,8 @@ pub async fn run_codex_tool_session(
         outgoing,
         id,
         running_requests_id_to_codex_uuid,
+        busy_conversations,
+        conversation_id,
     )
     .await;
 }
@@ -119,6 +150,7 @@ pub async fn run_codex_tool_session_reply(
     request_id: RequestId,
     prompt: String,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
+    busy_conversations: BusyConversations,
     conversation_id: ConversationId,
 ) {
     running_requests_id_to_codex_uuid
@@ -137,6 +169,9 @@ pub async fn run_codex_tool_session_reply(
             .lock()
             .await
             .remove(&request_id);
+        busy_conversations
+            .release(conversation_id, &request_id)
+            .await;
         return;
     }
 
@@ -145,6 +180,8 @@ pub async fn run_codex_tool_session_reply(
         outgoing,
         request_id,
         running_requests_id_to_codex_uuid,
+        busy_conversations,
+        conversation_id,
     )
     .await;
 }
@@ -154,6 +191,8 @@ async fn run_codex_tool_session_inner(
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
+    busy_conversations: BusyConversations,
+    conversation_id: ConversationId,
 ) {
     let request_id_str = match &request_id {
         RequestId::String(s) => s.clone(),
@@ -336,4 +375,6 @@ async fn run_codex_tool_session_inner(
             }
         }
     }
+
+    busy_conversations.release(conversation_id, &request_id).await;
 }
