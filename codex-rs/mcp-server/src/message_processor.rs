@@ -13,9 +13,11 @@ use codex_protocol::protocol::SessionSource;
 
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
+use codex_core::NewConversation;
 use codex_core::config::Config;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
+use codex_core::find_conversation_path_by_id_str;
 use codex_core::protocol::Submission;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
@@ -41,6 +43,8 @@ pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
     codex_linux_sandbox_exe: Option<PathBuf>,
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
     conversation_manager: Arc<ConversationManager>,
     busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ConversationId>>>,
@@ -61,11 +65,13 @@ impl MessageProcessor {
             config.cli_auth_credentials_store_mode,
         );
         let conversation_manager =
-            Arc::new(ConversationManager::new(auth_manager, SessionSource::Mcp));
+            Arc::new(ConversationManager::new(auth_manager.clone(), SessionSource::Mcp));
         Self {
             outgoing,
             initialized: false,
             codex_linux_sandbox_exe,
+            config: config.clone(),
+            auth_manager,
             conversation_manager,
             busy_conversations: BusyConversations::default(),
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
@@ -531,21 +537,98 @@ impl MessageProcessor {
         {
             Ok(c) => c,
             Err(_) => {
-                tracing::warn!("Session not found for conversation_id: {conversation_id}");
-                self.busy_conversations
-                    .release(conversation_id, &request_id)
-                    .await;
-                let result = CallToolResult {
-                    content: vec![ContentBlock::TextContent(TextContent {
-                        r#type: "text".to_owned(),
-                        text: format!("Session not found for conversation_id: {conversation_id}"),
-                        annotations: None,
-                    })],
-                    is_error: Some(true),
-                    structured_content: None,
+                tracing::warn!(
+                    "Session not found in memory for conversation_id: {conversation_id}; attempting disk resume"
+                );
+                let conversation_id_str = conversation_id.to_string();
+                let rollout_path = match find_conversation_path_by_id_str(
+                    &self.config.codex_home,
+                    &conversation_id_str,
+                )
+                .await
+                {
+                    Ok(Some(path)) => Some(path),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to search rollout for conversation_id {conversation_id}: {e}"
+                        );
+                        None
+                    }
                 };
-                outgoing.send_response(request_id, result).await;
-                return;
+                let Some(path) = rollout_path else {
+                    self.busy_conversations
+                        .release(conversation_id, &request_id)
+                        .await;
+                    let result = CallToolResult {
+                        content: vec![ContentBlock::TextContent(TextContent {
+                            r#type: "text".to_owned(),
+                            text: format!(
+                                "Session not found for conversation_id: {conversation_id} (no rollout on disk)"
+                            ),
+                            annotations: None,
+                        })],
+                        is_error: Some(true),
+                        structured_content: None,
+                    };
+                    outgoing.send_response(request_id, result).await;
+                    return;
+                };
+
+                let NewConversation {
+                    conversation,
+                    session_configured,
+                    ..
+                } = match self
+                    .conversation_manager
+                    .resume_conversation_from_rollout(
+                        self.config.as_ref().clone(),
+                        path,
+                        self.auth_manager.clone(),
+                    )
+                    .await
+                {
+                    Ok(resumed) => resumed,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to resume conversation_id {conversation_id} from rollout: {e}"
+                        );
+                        self.busy_conversations
+                            .release(conversation_id, &request_id)
+                            .await;
+                        let result = CallToolResult {
+                            content: vec![ContentBlock::TextContent(TextContent {
+                                r#type: "text".to_owned(),
+                                text: format!(
+                                    "Session not found for conversation_id: {conversation_id} (resume failed)"
+                                ),
+                                annotations: None,
+                            })],
+                            is_error: Some(true),
+                            structured_content: None,
+                        };
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                };
+
+                // Emit SessionConfigured for the resumed conversation for consistency.
+                let session_configured_event = codex_core::protocol::Event {
+                    id: "".to_string(),
+                    msg: codex_core::protocol::EventMsg::SessionConfigured(
+                        session_configured.clone(),
+                    ),
+                };
+                outgoing
+                    .send_event_as_notification(
+                        &session_configured_event,
+                        Some(crate::outgoing_message::OutgoingNotificationMeta::new(Some(
+                            request_id.clone(),
+                        ))),
+                    )
+                    .await;
+
+                conversation
             }
         };
 
