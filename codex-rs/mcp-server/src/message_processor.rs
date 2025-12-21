@@ -2,10 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use codex_core::AuthManager;
+use codex_core::NewThread;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
+use codex_core::find_conversation_path_by_id_str;
+use codex_core::protocol::Event;
+use codex_core::protocol::EventMsg;
 use codex_core::protocol::Submission;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -35,11 +39,14 @@ use crate::codex_tool_config::CodexToolCallReplyParam;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
 use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::outgoing_message::OutgoingNotificationMeta;
 
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     initialized: bool,
     codex_linux_sandbox_exe: Option<PathBuf>,
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
     busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
@@ -61,13 +68,15 @@ impl MessageProcessor {
         );
         let thread_manager = Arc::new(ThreadManager::new(
             config.codex_home.clone(),
-            auth_manager,
+            auth_manager.clone(),
             SessionSource::Mcp,
         ));
         Self {
             outgoing,
             initialized: false,
             codex_linux_sandbox_exe,
+            config: config.clone(),
+            auth_manager,
             thread_manager,
             busy_conversations: BusyConversations::default(),
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
@@ -487,18 +496,86 @@ impl MessageProcessor {
         let busy_conversations = self.busy_conversations.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
 
-        let codex = match thread_manager.get_thread(thread_id).await {
-            Ok(c) => c,
+        let (thread_id, codex) = match thread_manager.get_thread(thread_id).await {
+            Ok(c) => (thread_id, c),
             Err(_) => {
-                tracing::warn!("Session not found for thread_id: {thread_id}");
-                busy_conversations.release(thread_id, &request_id).await;
-                let result = crate::codex_tool_runner::create_call_tool_result_with_thread_id(
-                    thread_id,
-                    format!("Session not found for thread_id: {thread_id}"),
-                    Some(true),
+                tracing::warn!(
+                    "Session not found in memory for thread_id: {thread_id}; attempting disk resume"
                 );
-                outgoing.send_response(request_id, result).await;
-                return;
+
+                let thread_id_str = thread_id.to_string();
+                let rollout_path =
+                    match find_conversation_path_by_id_str(&self.config.codex_home, &thread_id_str)
+                        .await
+                    {
+                        Ok(Some(path)) => Some(path),
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to search rollout for thread_id {thread_id}: {e}"
+                            );
+                            None
+                        }
+                    };
+
+                let Some(path) = rollout_path else {
+                    busy_conversations.release(thread_id, &request_id).await;
+                    let result = crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                        thread_id,
+                        format!(
+                            "Session not found for thread_id: {thread_id} (no rollout on disk)"
+                        ),
+                        Some(true),
+                    );
+                    outgoing.send_response(request_id, result).await;
+                    return;
+                };
+
+                let NewThread {
+                    thread_id,
+                    thread,
+                    session_configured,
+                } = match thread_manager
+                    .resume_thread_from_rollout(
+                        self.config.as_ref().clone(),
+                        path,
+                        self.auth_manager.clone(),
+                    )
+                    .await
+                {
+                    Ok(resumed) => resumed,
+                    Err(e) => {
+                        tracing::warn!("Failed to resume thread_id {thread_id} from rollout: {e}");
+                        busy_conversations.release(thread_id, &request_id).await;
+                        let result =
+                            crate::codex_tool_runner::create_call_tool_result_with_thread_id(
+                                thread_id,
+                                format!(
+                                    "Session not found for thread_id: {thread_id} (resume failed)"
+                                ),
+                                Some(true),
+                            );
+                        outgoing.send_response(request_id, result).await;
+                        return;
+                    }
+                };
+
+                // Emit SessionConfigured for the resumed thread for consistency.
+                let session_configured_event = Event {
+                    id: "".to_string(),
+                    msg: EventMsg::SessionConfigured(session_configured.clone()),
+                };
+                outgoing
+                    .send_event_as_notification(
+                        &session_configured_event,
+                        Some(OutgoingNotificationMeta {
+                            request_id: Some(request_id.clone()),
+                            thread_id: Some(thread_id),
+                        }),
+                    )
+                    .await;
+
+                (thread_id, thread)
             }
         };
 
