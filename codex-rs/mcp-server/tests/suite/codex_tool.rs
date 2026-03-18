@@ -475,10 +475,17 @@ pub struct McpHandle {
 }
 
 async fn create_mcp_process(responses: Vec<String>) -> anyhow::Result<McpHandle> {
+    create_mcp_process_with_args(responses, &[]).await
+}
+
+async fn create_mcp_process_with_args(
+    responses: Vec<String>,
+    args: &[&str],
+) -> anyhow::Result<McpHandle> {
     let server = create_mock_responses_server(responses).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
-    let mut mcp_process = McpProcess::new(codex_home.path()).await?;
+    let mut mcp_process = McpProcess::new_with_args(codex_home.path(), args).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp_process.initialize()).await??;
     Ok(McpHandle {
         process: mcp_process,
@@ -513,4 +520,214 @@ stream_max_retries = 0
 "#
         ),
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_structured_only_response_format() {
+    if let Err(err) = structured_only_response_format().await {
+        panic!("failure: {err}");
+    }
+}
+
+async fn structured_only_response_format() -> anyhow::Result<()> {
+    let McpHandle {
+        process: mut mcp_process,
+        server: _server,
+        dir: _dir,
+    } = create_mcp_process_with_args(
+        vec![create_final_assistant_message_sse_response(
+            "Structured only!",
+        )?],
+        &["--tool-response-format", "structured-only"],
+    )
+    .await?;
+
+    let codex_request_id = mcp_process
+        .send_codex_tool_call(CodexToolCallParam {
+            prompt: "How are you?".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let codex_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(codex_request_id)),
+    )
+    .await??;
+
+    let content = codex_response
+        .result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(content, Vec::<serde_json::Value>::new());
+    assert_eq!(
+        codex_response
+            .result
+            .get("structuredContent")
+            .and_then(|value| value.get("content"))
+            .and_then(serde_json::Value::as_str),
+        Some("Structured only!")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_codex_reply_resumes_from_rollout() {
+    if let Err(err) = codex_reply_resumes_from_rollout().await {
+        panic!("failure: {err}");
+    }
+}
+
+async fn codex_reply_resumes_from_rollout() -> anyhow::Result<()> {
+    let server = create_mock_responses_server(vec![
+        create_final_assistant_message_sse_response("First answer")?,
+        create_final_assistant_message_sse_response("Resumed answer")?,
+    ])
+    .await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut first_process = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, first_process.initialize()).await??;
+    let first_request_id = first_process
+        .send_codex_tool_call(CodexToolCallParam {
+            prompt: "Say hello".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let first_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        first_process.read_stream_until_response_message(RequestId::Number(first_request_id)),
+    )
+    .await??;
+    let thread_id = extract_thread_id_from_tool_result(&first_response.result)?;
+    drop(first_process);
+
+    let mut second_process = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, second_process.initialize()).await??;
+    let reply_request_id = second_process
+        .send_codex_tool_call_reply(&thread_id, "Continue")
+        .await?;
+    let reply_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        second_process.read_stream_until_response_message(RequestId::Number(reply_request_id)),
+    )
+    .await??;
+    assert_eq!(
+        extract_thread_id_from_tool_result(&reply_response.result)?,
+        thread_id
+    );
+    assert_eq!(
+        reply_response
+            .result
+            .get("structuredContent")
+            .and_then(|value| value.get("content"))
+            .and_then(serde_json::Value::as_str),
+        Some("Resumed answer")
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_codex_reply_rejects_concurrent_requests() {
+    if env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    if let Err(err) = codex_reply_rejects_concurrent_requests().await {
+        panic!("failure: {err}");
+    }
+}
+
+async fn codex_reply_rejects_concurrent_requests() -> anyhow::Result<()> {
+    let cwd = TempDir::new()?;
+    let shell_command = if cfg!(windows) {
+        vec![
+            "New-Item".to_string(),
+            "-ItemType".to_string(),
+            "File".to_string(),
+            "-Path".to_string(),
+            "busy.txt".to_string(),
+            "-Force".to_string(),
+        ]
+    } else {
+        vec!["touch".to_string(), "busy.txt".to_string()]
+    };
+
+    let McpHandle {
+        process: mut mcp_process,
+        server: _server,
+        dir: _dir,
+    } = create_mcp_process(vec![create_shell_command_sse_response(
+        shell_command,
+        Some(cwd.path()),
+        Some(5_000),
+        "call1234",
+    )?])
+    .await?;
+
+    let request_id = mcp_process
+        .send_codex_tool_call(CodexToolCallParam {
+            prompt: "run a command".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    let session_configured = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_session_configured_notification(),
+    )
+    .await??;
+    let thread_id = extract_thread_id_from_session_notification(&session_configured)?;
+    let _elicitation = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_request_message(),
+    )
+    .await??;
+
+    let reply_request_id = mcp_process
+        .send_codex_tool_call_reply(&thread_id, "continue")
+        .await?;
+    let reply_response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp_process.read_stream_until_response_message(RequestId::Number(reply_request_id)),
+    )
+    .await??;
+    let busy_text = reply_response
+        .result
+        .get("structuredContent")
+        .and_then(|value| value.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("expected structuredContent.content"))?;
+    assert!(busy_text.contains("Conversation busy for conversation_id"));
+    assert!(busy_text.contains(&thread_id));
+    assert!(request_id >= 0);
+    Ok(())
+}
+
+fn extract_thread_id_from_tool_result(result: &serde_json::Value) -> anyhow::Result<String> {
+    result
+        .get("structuredContent")
+        .and_then(|value| value.get("threadId"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow::anyhow!("expected structuredContent.threadId"))
+}
+
+fn extract_thread_id_from_session_notification(
+    notification: &rmcp::model::JsonRpcNotification<rmcp::model::CustomNotification>,
+) -> anyhow::Result<String> {
+    notification
+        .notification
+        .params
+        .as_ref()
+        .and_then(|params| params.get("msg"))
+        .and_then(|msg| msg.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow::anyhow!("expected session_configured.msg.session_id"))
 }

@@ -2,16 +2,9 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
-use tokio::process::Child;
-use tokio::process::ChildStdin;
-use tokio::process::ChildStdout;
 
 use anyhow::Context;
 use codex_mcp_server::CodexToolCallParam;
-
 use pretty_assertions::assert_eq;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::ClientCapabilities;
@@ -29,6 +22,12 @@ use rmcp::model::JsonRpcVersion2_0;
 use rmcp::model::ProtocolVersion;
 use rmcp::model::RequestId;
 use serde_json::json;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::process::Child;
+use tokio::process::ChildStdin;
+use tokio::process::ChildStdout;
 use tokio::process::Command;
 
 pub struct McpProcess {
@@ -44,21 +43,27 @@ pub struct McpProcess {
 
 impl McpProcess {
     pub async fn new(codex_home: &Path) -> anyhow::Result<Self> {
-        Self::new_with_env(codex_home, &[]).await
+        Self::new_with_args_and_env(codex_home, &[], &[]).await
     }
 
-    /// Creates a new MCP process, allowing tests to override or remove
-    /// specific environment variables for the child process only.
+    pub async fn new_with_args(codex_home: &Path, args: &[&str]) -> anyhow::Result<Self> {
+        Self::new_with_args_and_env(codex_home, args, &[]).await
+    }
+
+    /// Creates a new MCP process, allowing tests to pass CLI arguments and
+    /// override or remove specific environment variables for the child process only.
     ///
     /// Pass a tuple of (key, Some(value)) to set/override, or (key, None) to
     /// remove a variable from the child's environment.
-    pub async fn new_with_env(
+    pub async fn new_with_args_and_env(
         codex_home: &Path,
+        args: &[&str],
         env_overrides: &[(&str, Option<&str>)],
     ) -> anyhow::Result<Self> {
         let program = codex_utils_cargo_bin::cargo_bin("codex-mcp-server")
             .context("should find binary for codex-mcp-server")?;
         let mut cmd = Command::new(program);
+        cmd.args(args);
 
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -91,8 +96,6 @@ impl McpProcess {
             .ok_or_else(|| anyhow::format_err!("mcp should have stdout fd"))?;
         let stdout = BufReader::new(stdout);
 
-        // Forward child's stderr to our stderr so failures are visible even
-        // when stdout/stderr are captured by the test harness.
         if let Some(stderr) = process.stderr.take() {
             let mut stderr_reader = BufReader::new(stderr).lines();
             tokio::spawn(async move {
@@ -186,7 +189,6 @@ impl McpProcess {
             })
         );
 
-        // Send notifications/initialized to ack the response.
         self.send_jsonrpc_message(JsonRpcMessage::Notification(JsonRpcNotification {
             jsonrpc: JsonRpcVersion2_0,
             notification: CustomNotification::new("notifications/initialized", None),
@@ -209,6 +211,32 @@ impl McpProcess {
                 serde_json::Value::Object(map) => map,
                 _ => unreachable!("params serialize to object"),
             }),
+            task: None,
+        };
+        self.send_request(
+            "tools/call",
+            Some(serde_json::to_value(codex_tool_call_params)?),
+        )
+        .await
+    }
+
+    pub async fn send_codex_tool_call_reply(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+    ) -> anyhow::Result<i64> {
+        let codex_tool_call_params = CallToolRequestParams {
+            meta: None,
+            name: "codex-reply".into(),
+            arguments: Some(
+                match json!({
+                    "threadId": thread_id,
+                    "prompt": prompt,
+                }) {
+                    serde_json::Value::Object(map) => map,
+                    _ => unreachable!("params serialize to object"),
+                },
+            ),
             task: None,
         };
         self.send_request(
@@ -323,6 +351,40 @@ impl McpProcess {
         }
     }
 
+    pub async fn read_stream_until_session_configured_notification(
+        &mut self,
+    ) -> anyhow::Result<JsonRpcNotification<CustomNotification>> {
+        loop {
+            let message = self.read_jsonrpc_message().await?;
+            match message {
+                JsonRpcMessage::Notification(notification) => {
+                    let is_match = notification.notification.method == "codex/event"
+                        && notification
+                            .notification
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("msg"))
+                            .and_then(|msg| msg.get("type"))
+                            .and_then(|value| value.as_str())
+                            == Some("session_configured");
+                    if is_match {
+                        return Ok(notification);
+                    }
+                    eprintln!("ignoring notification: {notification:?}");
+                }
+                JsonRpcMessage::Request(_) => {
+                    anyhow::bail!("unexpected JSONRPCMessage::Request: {message:?}");
+                }
+                JsonRpcMessage::Error(_) => {
+                    anyhow::bail!("unexpected JSONRPCMessage::Error: {message:?}");
+                }
+                JsonRpcMessage::Response(_) => {
+                    anyhow::bail!("unexpected JSONRPCMessage::Response: {message:?}");
+                }
+            }
+        }
+    }
+
     /// Reads notifications until a legacy TurnComplete event is observed:
     /// Method "codex/event" with params.msg.type == "task_complete".
     pub async fn read_stream_until_legacy_task_complete_notification(
@@ -350,9 +412,8 @@ impl McpProcess {
 
                     if is_match {
                         return Ok(notification);
-                    } else {
-                        eprintln!("ignoring notification: {notification:?}");
                     }
+                    eprintln!("ignoring notification: {notification:?}");
                 }
                 JsonRpcMessage::Request(_) => {
                     anyhow::bail!("unexpected JSONRPCMessage::Request: {message:?}");
@@ -387,12 +448,12 @@ impl Drop for McpProcess {
         let _ = self.process.start_kill();
 
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
+        let timeout = std::time::Duration::from_secs(2);
         while start.elapsed() < timeout {
             match self.process.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                Err(_) => return,
+                Ok(Some(_status)) => return,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Err(_err) => return,
             }
         }
     }
