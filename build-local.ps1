@@ -7,7 +7,6 @@ $RepoRoot = $PSScriptRoot
 $codexRsRoot = Join-Path $RepoRoot "codex-rs"
 $codexCliRoot = Join-Path $RepoRoot "codex-cli"
 $triple = "x86_64-pc-windows-gnu"
-$vendorTarget = "x86_64-pc-windows-msvc"
 
 $hash = (git -C $RepoRoot rev-parse --short HEAD).Trim()
 
@@ -27,52 +26,35 @@ if (-not (Test-Path $srcExe)) {
   throw "Built binary not found: $srcExe"
 }
 
-# Find existing vendor
-$vendorSrc = $null
+# Find existing codex binary from npm global install (new structure)
 $npmRoot = (npm root -g).Trim()
-if ($npmRoot) {
-  $globalVendor = Join-Path $npmRoot "@openai\codex\vendor"
-  if (Test-Path $globalVendor) {
-    $vendorSrc = $globalVendor
-  }
-}
-if (-not $vendorSrc) {
-  throw "Vendor not found. Run: npm install -g @openai/codex"
+if (-not $npmRoot) {
+  throw "npm root not found"
 }
 
-$vendorTargetSrc = Join-Path $vendorSrc $vendorTarget
-if (-not (Test-Path $vendorTargetSrc)) {
-  throw "Vendor target not found: $vendorTargetSrc"
+$win64PkgDir = Join-Path $npmRoot "@openai\codex\node_modules\@openai\codex-win32-x64"
+if (-not (Test-Path $win64PkgDir)) {
+  throw "codex-win32-x64 package not found at: $win64PkgDir`nRun: npm install -g @openai/codex"
 }
 
-# Build temp vendor with custom codex.exe
-$vendorTmp = Join-Path $env:TEMP "codex-vendor-$hash"
-if (Test-Path $vendorTmp) { Remove-Item -Recurse -Force $vendorTmp }
-New-Item -ItemType Directory -Force -Path $vendorTmp | Out-Null
-Copy-Item -Recurse -Force $vendorTargetSrc (Join-Path $vendorTmp $vendorTarget)
+# Find the existing codex.exe in the platform package
+$existingExe = Get-ChildItem -Path $win64PkgDir -Filter "codex.exe" -Recurse | Select-Object -First 1
+if (-not $existingExe) {
+  throw "codex.exe not found in: $win64PkgDir"
+}
 
-$destExe = Join-Path $vendorTmp "$vendorTarget\codex\codex.exe"
-Copy-Item $srcExe $destExe -Force
+Write-Host "Found existing binary: $($existingExe.FullName)"
+Write-Host "Replacing with local build (commit $hash) ..."
 
-# Stage npm package
-$packageJson = Get-Content (Join-Path $codexCliRoot "package.json") -Raw | ConvertFrom-Json
-$version = "$($packageJson.version -replace '\+.*$', '')+local.$hash"
+# Backup original
+$backupExe = "$($existingExe.FullName).bak"
+if (-not (Test-Path $backupExe)) {
+  Copy-Item $existingExe.FullName $backupExe
+  Write-Host "Backed up original to: $backupExe"
+}
 
-$stageDir = Join-Path $env:TEMP "codex-npm-stage-$hash"
-if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
+# Replace with local build
+Copy-Item $srcExe $existingExe.FullName -Force
 
-$buildScript = Join-Path $codexCliRoot "scripts\build_npm_package.py"
-Push-Location $codexCliRoot
-python $buildScript --version $version --package codex --vendor-src $vendorTmp --staging-dir $stageDir
-Pop-Location
-if ($LASTEXITCODE -ne 0) { throw "build_npm_package failed" }
-
-# Install directly from staging dir
-npm install -g $stageDir
-if ($LASTEXITCODE -ne 0) { throw "npm install -g failed" }
-
-Write-Host "Installed: $version"
-
-# Cleanup
-ls $stageDir
-ls "$stageDir\bin"
+Write-Host "Installed local codex (commit $hash) -> $($existingExe.FullName)"
+codex --version
