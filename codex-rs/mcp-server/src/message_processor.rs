@@ -37,10 +37,11 @@ use tokio::task;
 use crate::busy_conversations::BusyConversations;
 use crate::codex_tool_config::CodexToolCallParam;
 use crate::codex_tool_config::CodexToolCallReplyParam;
-use crate::codex_tool_config::create_tool_for_codex_tool_call_param;
-use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param;
+use crate::codex_tool_config::create_tool_for_codex_tool_call_param_with_format;
+use crate::codex_tool_config::create_tool_for_codex_tool_call_reply_param_with_format;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotificationMeta;
+use crate::tool_response_format::ToolResponseFormat;
 
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
@@ -51,6 +52,7 @@ pub(crate) struct MessageProcessor {
     thread_manager: Arc<ThreadManager>,
     busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    tool_response_format: ToolResponseFormat,
 }
 
 impl MessageProcessor {
@@ -60,7 +62,8 @@ impl MessageProcessor {
         outgoing: OutgoingMessageSender,
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
-        ) -> Self {
+        tool_response_format: ToolResponseFormat,
+    ) -> Self {
         let outgoing = Arc::new(outgoing);
         let auth_manager = AuthManager::shared(
             config.codex_home.clone(),
@@ -86,6 +89,7 @@ impl MessageProcessor {
             thread_manager,
             busy_conversations: BusyConversations::default(),
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
+            tool_response_format,
         }
     }
 
@@ -328,8 +332,8 @@ impl MessageProcessor {
         let result = rmcp::model::ListToolsResult {
             meta: None,
             tools: vec![
-                create_tool_for_codex_tool_call_param(),
-                create_tool_for_codex_tool_call_reply_param(),
+                create_tool_for_codex_tool_call_param_with_format(self.tool_response_format),
+                create_tool_for_codex_tool_call_reply_param_with_format(self.tool_response_format),
             ],
             next_cursor: None,
         };
@@ -415,6 +419,7 @@ impl MessageProcessor {
         let thread_manager = self.thread_manager.clone();
         let busy_conversations = self.busy_conversations.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
+        let tool_response_format = self.tool_response_format;
 
         task::spawn(async move {
             crate::codex_tool_runner::run_codex_tool_session(
@@ -425,7 +430,8 @@ impl MessageProcessor {
                 thread_manager,
                 busy_conversations,
                 running_requests_id_to_codex_uuid,
-                )
+                tool_response_format,
+            )
             .await;
         });
     }
@@ -501,6 +507,7 @@ impl MessageProcessor {
                     "Conversation busy for conversation_id: {thread_id} (in-flight request: {owner_text})"
                 ),
                 Some(true),
+                self.tool_response_format,
             );
             self.outgoing.send_response(request_id, result).await;
             return;
@@ -510,6 +517,7 @@ impl MessageProcessor {
         let thread_manager = self.thread_manager.clone();
         let busy_conversations = self.busy_conversations.clone();
         let running_requests_id_to_codex_uuid = self.running_requests_id_to_codex_uuid.clone();
+        let tool_response_format = self.tool_response_format;
 
         let (thread_id, codex) = match thread_manager.get_thread(thread_id).await {
             Ok(c) => (thread_id, c),
@@ -540,7 +548,8 @@ impl MessageProcessor {
                             "Session not found for thread_id: {thread_id} (no rollout on disk)"
                         ),
                         Some(true),
-                            );
+                        self.tool_response_format,
+                    );
                     outgoing.send_response(request_id, result).await;
                     return;
                 };
@@ -569,7 +578,8 @@ impl MessageProcessor {
                                     "Session not found for thread_id: {thread_id} (resume failed)"
                                 ),
                                 Some(true),
-                                            );
+                                self.tool_response_format,
+                            );
                         outgoing.send_response(request_id, result).await;
                         return;
                     }
@@ -607,7 +617,8 @@ impl MessageProcessor {
                     prompt,
                     busy_conversations,
                     running_requests_id_to_codex_uuid,
-                        )
+                    tool_response_format,
+                )
                 .await;
             }
         });

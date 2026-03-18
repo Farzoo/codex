@@ -1,4 +1,4 @@
-//! Asynchronous worker that executes a **Codex** tool-call inside a spawned
+﻿//! Asynchronous worker that executes a **Codex** tool-call inside a spawned
 //! Tokio task. Separated from `message_processor.rs` to keep that file small
 //! and to make future feature-growth easier to manage.
 
@@ -10,6 +10,7 @@ use crate::exec_approval::handle_exec_approval_request;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotificationMeta;
 use crate::patch_approval::handle_patch_approval_request;
+use crate::tool_response_format::ToolResponseFormat;
 use codex_core::CodexThread;
 use codex_core::NewThread;
 use codex_core::ThreadManager;
@@ -38,17 +39,25 @@ pub(crate) fn create_call_tool_result_with_thread_id(
     thread_id: ThreadId,
     text: String,
     is_error: Option<bool>,
+    tool_response_format: ToolResponseFormat,
 ) -> CallToolResult {
-    let content_text = text;
-    let content = vec![Content::text(content_text.clone())];
-    let structured_content = json!({
-        "threadId": thread_id,
-        "content": content_text,
-    });
+    let content = if tool_response_format.includes_text_content() {
+        vec![Content::text(text.clone())]
+    } else {
+        Vec::new()
+    };
+    let structured_content = if tool_response_format.includes_structured_content() {
+        Some(json!({
+            "threadId": thread_id,
+            "content": text,
+        }))
+    } else {
+        None
+    };
     CallToolResult {
         content,
         is_error,
-        structured_content: Some(structured_content),
+        structured_content,
         meta: None,
     }
 }
@@ -65,6 +74,7 @@ pub async fn run_codex_tool_session(
     thread_manager: Arc<ThreadManager>,
     busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    tool_response_format: ToolResponseFormat,
 ) {
     let NewThread {
         thread_id,
@@ -92,6 +102,7 @@ pub async fn run_codex_tool_session(
                 "Conversation busy for conversation_id: {thread_id} (in-flight request: {owner_text})"
             ),
             Some(true),
+            tool_response_format,
         );
         outgoing.send_response(id.clone(), result).await;
         thread_manager.remove_thread(&thread_id).await;
@@ -99,7 +110,6 @@ pub async fn run_codex_tool_session(
     }
 
     let session_configured_event = Event {
-        // Use a fake id value for now.
         id: "".to_string(),
         msg: EventMsg::SessionConfigured(session_configured.clone()),
     };
@@ -113,20 +123,16 @@ pub async fn run_codex_tool_session(
         )
         .await;
 
-    // Use the original MCP request ID as the `sub_id` for the Codex submission so that
-    // any events emitted for this tool-call can be correlated with the
-    // originating `tools/call` request.
     let sub_id = id.to_string();
     running_requests_id_to_codex_uuid
         .lock()
         .await
         .insert(id.clone(), thread_id);
     let submission = Submission {
-        id: sub_id.clone(),
+        id: sub_id,
         op: Op::UserInput {
             items: vec![UserInput::Text {
-                text: initial_prompt.clone(),
-                // MCP tool prompts are plain text with no UI element ranges.
+                text: initial_prompt,
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -140,9 +146,9 @@ pub async fn run_codex_tool_session(
             thread_id,
             format!("Failed to submit initial prompt: {e}"),
             Some(true),
+            tool_response_format,
         );
         outgoing.send_response(id.clone(), result).await;
-        // unregister the id so we don't keep it in the map
         running_requests_id_to_codex_uuid.lock().await.remove(&id);
         busy_conversations.release(thread_id, &id).await;
         return;
@@ -155,6 +161,7 @@ pub async fn run_codex_tool_session(
         id,
         busy_conversations,
         running_requests_id_to_codex_uuid,
+        tool_response_format,
     )
     .await;
 }
@@ -167,6 +174,7 @@ pub async fn run_codex_tool_session_reply(
     prompt: String,
     busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    tool_response_format: ToolResponseFormat,
 ) {
     running_requests_id_to_codex_uuid
         .lock()
@@ -176,7 +184,6 @@ pub async fn run_codex_tool_session_reply(
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: prompt,
-                // MCP tool prompts are plain text with no UI element ranges.
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -188,9 +195,9 @@ pub async fn run_codex_tool_session_reply(
             thread_id,
             format!("Failed to submit user input: {e}"),
             Some(true),
+            tool_response_format,
         );
         outgoing.send_response(request_id.clone(), result).await;
-        // unregister the id so we don't keep it in the map
         running_requests_id_to_codex_uuid
             .lock()
             .await
@@ -206,6 +213,7 @@ pub async fn run_codex_tool_session_reply(
         request_id,
         busy_conversations,
         running_requests_id_to_codex_uuid,
+        tool_response_format,
     )
     .await;
 }
@@ -217,11 +225,10 @@ async fn run_codex_tool_session_inner(
     request_id: RequestId,
     busy_conversations: BusyConversations,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    tool_response_format: ToolResponseFormat,
 ) {
     let request_id_str = request_id.to_string();
 
-    // Stream events until the task needs to pause for user interaction or
-    // completes.
     loop {
         match thread.next_event().await {
             Ok(event) => {
@@ -273,11 +280,11 @@ async fn run_codex_tool_session_inner(
                         continue;
                     }
                     EventMsg::Error(err_event) => {
-                        // Always respond in tools/call's expected shape, and include conversationId so the client can resume.
                         let result = create_call_tool_result_with_thread_id(
                             thread_id,
                             err_event.message,
                             Some(true),
+                            tool_response_format,
                         );
                         outgoing.send_response(request_id.clone(), result).await;
                         break;
@@ -289,7 +296,6 @@ async fn run_codex_tool_session_inner(
                         continue;
                     }
                     EventMsg::ElicitationRequest(_) => {
-                        // TODO: forward elicitation requests to the client?
                         continue;
                     }
                     EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
@@ -317,15 +323,14 @@ async fn run_codex_tool_session_inner(
                     EventMsg::TurnComplete(TurnCompleteEvent {
                         last_agent_message, ..
                     }) => {
-                        let text = match last_agent_message {
-                            Some(msg) => msg,
-                            None => "".to_string(),
-                        };
+                        let text = last_agent_message.unwrap_or_default();
                         let result = create_call_tool_result_with_thread_id(
-                            thread_id, text, /*is_error*/ None,
+                            thread_id,
+                            text,
+                            None,
+                            tool_response_format,
                         );
                         outgoing.send_response(request_id.clone(), result).await;
-                        // unregister the id so we don't keep it in the map
                         running_requests_id_to_codex_uuid
                             .lock()
                             .await
@@ -335,21 +340,11 @@ async fn run_codex_tool_session_inner(
                     EventMsg::SessionConfigured(_) => {
                         tracing::error!("unexpected SessionConfigured event");
                     }
-                    EventMsg::ThreadNameUpdated(_) => {
-                        // Ignore session metadata updates in MCP tool runner.
-                    }
-                    EventMsg::AgentMessageDelta(_) => {
-                        // TODO: think how we want to support this in the MCP
-                    }
-                    EventMsg::AgentReasoningDelta(_) => {
-                        // TODO: think how we want to support this in the MCP
-                    }
-                    EventMsg::McpStartupUpdate(_) | EventMsg::McpStartupComplete(_) => {
-                        // Ignored in MCP tool runner.
-                    }
-                    EventMsg::AgentMessage(AgentMessageEvent { .. }) => {
-                        // TODO: think how we want to support this in the MCP
-                    }
+                    EventMsg::ThreadNameUpdated(_) => {}
+                    EventMsg::AgentMessageDelta(_) => {}
+                    EventMsg::AgentReasoningDelta(_) => {}
+                    EventMsg::McpStartupUpdate(_) | EventMsg::McpStartupComplete(_) => {}
+                    EventMsg::AgentMessage(AgentMessageEvent { .. }) => {}
                     EventMsg::AgentReasoningRawContent(_)
                     | EventMsg::AgentReasoningRawContentDelta(_)
                     | EventMsg::TurnStarted(_)
@@ -413,14 +408,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::RealtimeConversationStarted(_)
                     | EventMsg::RealtimeConversationRealtime(_)
                     | EventMsg::RealtimeConversationClosed(_)
-                    | EventMsg::DeprecationNotice(_) => {
-                        // For now, we do not do anything extra for these
-                        // events. Note that
-                        // send(codex_event_to_notification(&event)) above has
-                        // already dispatched these events as notifications,
-                        // though we may want to do give different treatment to
-                        // individual events in the future.
-                    }
+                    | EventMsg::DeprecationNotice(_) => {}
                 }
             }
             Err(e) => {
@@ -428,6 +416,7 @@ async fn run_codex_tool_session_inner(
                     thread_id,
                     format!("Codex runtime error: {e}"),
                     Some(true),
+                    tool_response_format,
                 );
                 outgoing.send_response(request_id.clone(), result).await;
                 break;
@@ -444,9 +433,15 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn call_tool_result_includes_thread_id_in_structured_content() {
+    fn dual_format_includes_text_and_structured_content() {
         let thread_id = ThreadId::new();
-        let result = create_call_tool_result_with_thread_id(thread_id, "done".to_string(), None);
+        let result = create_call_tool_result_with_thread_id(
+            thread_id,
+            "done".to_string(),
+            None,
+            ToolResponseFormat::Dual,
+        );
+        assert_eq!(result.content, vec![Content::text("done")]);
         assert_eq!(
             result.structured_content,
             Some(json!({
@@ -454,5 +449,37 @@ mod tests {
                 "content": "done",
             }))
         );
+    }
+
+    #[test]
+    fn structured_only_format_omits_text_content() {
+        let thread_id = ThreadId::new();
+        let result = create_call_tool_result_with_thread_id(
+            thread_id,
+            "done".to_string(),
+            None,
+            ToolResponseFormat::StructuredOnly,
+        );
+        assert_eq!(result.content, Vec::<Content>::new());
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "threadId": thread_id,
+                "content": "done",
+            }))
+        );
+    }
+
+    #[test]
+    fn content_only_format_omits_structured_content() {
+        let thread_id = ThreadId::new();
+        let result = create_call_tool_result_with_thread_id(
+            thread_id,
+            "done".to_string(),
+            None,
+            ToolResponseFormat::ContentOnly,
+        );
+        assert_eq!(result.content, vec![Content::text("done")]);
+        assert_eq!(result.structured_content, None);
     }
 }

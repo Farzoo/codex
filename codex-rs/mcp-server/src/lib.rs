@@ -30,11 +30,13 @@ mod exec_approval;
 pub(crate) mod message_processor;
 mod outgoing_message;
 mod patch_approval;
+pub mod tool_response_format;
 
 use crate::message_processor::MessageProcessor;
 use crate::outgoing_message::OutgoingJsonRpcMessage;
 use crate::outgoing_message::OutgoingMessage;
 use crate::outgoing_message::OutgoingMessageSender;
+use crate::tool_response_format::ToolResponseFormat;
 
 pub use crate::codex_tool_config::CodexToolCallParam;
 pub use crate::codex_tool_config::CodexToolCallReplyParam;
@@ -55,6 +57,7 @@ type IncomingMessage = JsonRpcMessage<ClientRequest, Value, ClientNotification>;
 pub async fn run_main(
     arg0_paths: Arg0DispatchPaths,
     cli_config_overrides: CliConfigOverrides,
+    tool_response_format: ToolResponseFormat,
 ) -> IoResult<()> {
     // Parse CLI overrides once and derive the base Config eagerly so later
     // components do not need to work with raw TOML values.
@@ -129,6 +132,7 @@ pub async fn run_main(
             outgoing_message_sender,
             arg0_paths,
             std::sync::Arc::new(config),
+            tool_response_format,
         );
         async move {
             while let Some(msg) = incoming_rx.recv().await {

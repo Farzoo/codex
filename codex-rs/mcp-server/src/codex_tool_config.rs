@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::tool_response_format::ToolResponseFormat;
+
 /// Client-supplied configuration for a `codex` tool-call.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -107,7 +109,9 @@ impl From<CodexToolCallSandboxMode> for SandboxMode {
 }
 
 /// Builds a `Tool` definition (JSON schema etc.) for the Codex tool-call.
-pub(crate) fn create_tool_for_codex_tool_call_param() -> Tool {
+pub(crate) fn create_tool_for_codex_tool_call_param_with_format(
+    tool_response_format: ToolResponseFormat,
+) -> Tool {
     let schema = SchemaSettings::draft2019_09()
         .with(|s| {
             s.inline_subschemas = true;
@@ -122,7 +126,7 @@ pub(crate) fn create_tool_for_codex_tool_call_param() -> Tool {
         name: "codex".into(),
         title: Some("Codex".to_string()),
         input_schema,
-        output_schema: Some(codex_tool_output_schema()),
+        output_schema: codex_tool_output_schema(tool_response_format),
         description: Some(
             "Run a Codex session. Accepts configuration parameters matching the Codex Config struct."
                 .into(),
@@ -134,7 +138,11 @@ pub(crate) fn create_tool_for_codex_tool_call_param() -> Tool {
     }
 }
 
-fn codex_tool_output_schema() -> Arc<JsonObject> {
+fn codex_tool_output_schema(tool_response_format: ToolResponseFormat) -> Option<Arc<JsonObject>> {
+    if !tool_response_format.includes_structured_content() {
+        return None;
+    }
+
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -144,7 +152,7 @@ fn codex_tool_output_schema() -> Arc<JsonObject> {
         "required": ["threadId", "content"],
     });
     match schema {
-        serde_json::Value::Object(map) => Arc::new(map),
+        serde_json::Value::Object(map) => Some(Arc::new(map)),
         _ => unreachable!("json literal must be an object"),
     }
 }
@@ -231,7 +239,9 @@ impl CodexToolCallReplyParam {
 }
 
 /// Builds a `Tool` definition for the `codex-reply` tool-call.
-pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
+pub(crate) fn create_tool_for_codex_tool_call_reply_param_with_format(
+    tool_response_format: ToolResponseFormat,
+) -> Tool {
     let schema = SchemaSettings::draft2019_09()
         .with(|s| {
             s.inline_subschemas = true;
@@ -246,7 +256,7 @@ pub(crate) fn create_tool_for_codex_tool_call_reply_param() -> Tool {
         name: "codex-reply".into(),
         title: Some("Codex Reply".to_string()),
         input_schema,
-        output_schema: Some(codex_tool_output_schema()),
+        output_schema: codex_tool_output_schema(tool_response_format),
         description: Some(
             "Continue a Codex conversation by providing the thread id and prompt.".into(),
         ),
@@ -299,7 +309,7 @@ mod tests {
     /// https://github.com/modelcontextprotocol/inspector/pull/196
     #[test]
     fn verify_codex_tool_json_schema() {
-        let tool = create_tool_for_codex_tool_call_param();
+        let tool = create_tool_for_codex_tool_call_param_with_format(ToolResponseFormat::Dual);
         let tool_json = serde_json::to_value(&tool).expect("tool serializes");
         let expected_tool_json = serde_json::json!({
           "description": "Run a Codex session. Accepts configuration parameters matching the Codex Config struct.",
@@ -385,8 +395,16 @@ mod tests {
     }
 
     #[test]
+    fn codex_tool_omits_output_schema_in_content_only_mode() {
+        let tool =
+            create_tool_for_codex_tool_call_param_with_format(ToolResponseFormat::ContentOnly);
+        assert_eq!(tool.output_schema, None);
+    }
+
+    #[test]
     fn verify_codex_tool_reply_json_schema() {
-        let tool = create_tool_for_codex_tool_call_reply_param();
+        let tool =
+            create_tool_for_codex_tool_call_reply_param_with_format(ToolResponseFormat::Dual);
         let tool_json = serde_json::to_value(&tool).expect("tool serializes");
         let expected_tool_json = serde_json::json!({
           "description": "Continue a Codex conversation by providing the thread id and prompt.",
@@ -406,9 +424,9 @@ mod tests {
               }
             },
             "required": [
-              "prompt",
+              "prompt"
             ],
-            "type": "object",
+            "type": "object"
           },
           "name": "codex-reply",
           "outputSchema": {
@@ -426,7 +444,7 @@ mod tests {
             ],
             "type": "object"
           },
-          "title": "Codex Reply",
+          "title": "Codex Reply"
         });
         assert_eq!(expected_tool_json, tool_json);
     }

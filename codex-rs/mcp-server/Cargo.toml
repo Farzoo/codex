@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "codex-mcp-server"
 version.workspace = true
 edition.workspace = true
@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
 codex-arg0 = { workspace = true }
 codex-core = { workspace = true }
 codex-protocol = { workspace = true }
@@ -45,3 +46,4 @@ os_info = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+
