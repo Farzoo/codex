@@ -34,7 +34,7 @@ Codex CLI functions as an MCP client that allows the Codex CLI and IDE extension
 
 #### MCP server (experimental)
 
-Codex can be launched as an MCP _server_ by running `codex mcp-server`. This allows _other_ MCP clients to use Codex as a tool for another agent.
+Codex can be launched as an MCP _server_ by running `codex mcp-server`. This allows _other_ MCP clients to use Codex as a tool for another agent. You can control tool response formatting with `--tool-response-format dual|structured-only|content-only`.
 
 Use the [`@modelcontextprotocol/inspector`](https://github.com/modelcontextprotocol/inspector) to try it out:
 

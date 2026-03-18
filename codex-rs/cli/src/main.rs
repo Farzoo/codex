@@ -85,6 +85,13 @@ struct MultitoolCli {
     subcommand: Option<Subcommand>,
 }
 
+#[derive(Debug, Parser)]
+struct McpServerCommand {
+    /// Format used for codex tool-call responses.
+    #[arg(long = "tool-response-format", default_value = "dual")]
+    tool_response_format: ToolResponseFormat,
+}
+
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
     /// Run Codex non-interactively.
@@ -104,7 +111,7 @@ enum Subcommand {
     Mcp(McpCli),
 
     /// Start Codex as an MCP server (stdio).
-    McpServer,
+    McpServer(McpServerCommand),
 
     /// [experimental] Run the app server or related tooling.
     AppServer(AppServerCommand),
@@ -641,12 +648,12 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             );
             codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
         }
-        Some(Subcommand::McpServer) => {
+        Some(Subcommand::McpServer(mcp_server_cmd)) => {
             reject_remote_mode_for_subcommand(root_remote.as_deref(), "mcp-server")?;
             codex_mcp_server::run_main(
                 arg0_paths.clone(),
                 root_config_overrides,
-                ToolResponseFormat::Dual,
+                mcp_server_cmd.tool_response_format,
             )
             .await?;
         }

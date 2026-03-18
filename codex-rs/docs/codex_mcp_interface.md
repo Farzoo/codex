@@ -40,6 +40,12 @@ Run Codex as an MCP server and connect an MCP client:
 codex mcp-server | your_mcp_client
 ```
 
+To return only structured content from the `codex` tools, start the server with:
+
+```bash
+codex mcp-server --tool-response-format structured-only
+```
+
 For a simple inspection UI, you can also try:
 
 ```bash
