@@ -21,6 +21,7 @@ use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
 use codex_exec::ReviewArgs;
 use codex_execpolicy::ExecPolicyCheckCommand;
+use codex_mcp_server::tool_response_format::ToolResponseFormat;
 use codex_responses_api_proxy::Args as ResponsesApiProxyArgs;
 use codex_state::StateRuntime;
 use codex_state::state_db_path;
@@ -642,7 +643,12 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
         }
         Some(Subcommand::McpServer) => {
             reject_remote_mode_for_subcommand(root_remote.as_deref(), "mcp-server")?;
-            codex_mcp_server::run_main(arg0_paths.clone(), root_config_overrides).await?;
+            codex_mcp_server::run_main(
+                arg0_paths.clone(),
+                root_config_overrides,
+                ToolResponseFormat::Dual,
+            )
+            .await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             reject_remote_mode_for_subcommand(root_remote.as_deref(), "mcp")?;
